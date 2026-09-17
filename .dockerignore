@@ -1,0 +1,16 @@
+node_modules
+**/node_modules
+dist
+**/dist
+**/.turbo
+*.tsbuildinfo
+coverage
+.git
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+*.log
+.env
+.env.*
+!.env.example

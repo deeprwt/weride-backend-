@@ -1,0 +1,374 @@
+// WeRide Prisma schema — Phase 1.
+//
+// Phase 0: users, user_roles, audit_logs, idempotency_keys.
+// Phase 1: extends users with auth fields; adds auth_sessions and otp_attempts.
+//
+// PostGIS + extension setup happens via raw migration (see prisma/migrations).
+// Domain tables (rides, vehicles, etc.) land per phase — do not pre-define them
+// here; they have geospatial columns Prisma doesn't model natively and we want
+// the schema to grow incrementally with feature work.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+  binaryTargets   = ["native"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [postgis, pgcrypto, pg_trgm]
+}
+
+enum UserRole {
+  rider
+  driver
+  admin
+  ops
+  support
+}
+
+model User {
+  id                  String    @id @default(uuid()) @db.Uuid
+  phone               String?   @unique @db.Text
+  email               String?   @unique @db.Text
+  fullName            String?   @map("full_name") @db.Text
+  locale              String    @default("en-CA") @db.Text
+  // Phase 1: auth
+  authProvider        String    @default("local") @map("auth_provider") @db.Text
+  emailVerifiedAt     DateTime? @map("email_verified_at") @db.Timestamptz()
+  phoneVerifiedAt     DateTime? @map("phone_verified_at") @db.Timestamptz()
+  passwordHash        String?   @map("password_hash") @db.Text
+  totpSecretEncrypted String?   @map("totp_secret_encrypted") @db.Text
+  totpEnrolledAt      DateTime? @map("totp_enrolled_at") @db.Timestamptz()
+  recoveryCodes       Json?     @map("recovery_codes") @db.JsonB
+  lastLoginAt         DateTime? @map("last_login_at") @db.Timestamptz()
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt           DateTime? @map("deleted_at") @db.Timestamptz()
+  // Rider profile (migration 0008). All optional: the app never blocks a
+  // booking on them.
+  gender                String?   @db.Text
+  dateOfBirth           DateTime? @map("date_of_birth") @db.Date
+  emergencyContactName  String?   @map("emergency_contact_name") @db.Text
+  emergencyContactPhone String?   @map("emergency_contact_phone") @db.Text
+
+  savedPlaces SavedPlace[]
+  roles     UserRoleAssignment[]
+  auditLogs AuditLog[]
+  sessions  AuthSession[]
+  rides     Ride[]               @relation("RiderRides")
+
+  // Phase 2 — driver side. `driverProfile` is the user's own application;
+  // the two review relations are the ops actions this user has taken on
+  // OTHER drivers, which is why they are named separately.
+  driverProfile    DriverProfile?   @relation("DriverProfileUser")
+  driverApprovals  DriverProfile[]  @relation("DriverApprovedBy")
+  documentReviews  DriverDocument[] @relation("DocumentReviewedBy")
+
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model UserRoleAssignment {
+  userId    String   @map("user_id") @db.Uuid
+  role      UserRole
+  grantedAt DateTime @default(now()) @map("granted_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, role])
+  @@map("user_roles")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actorId    String?  @map("actor_id") @db.Uuid
+  actorRole  String?  @map("actor_role") @db.Text
+  action     String   @db.Text
+  resource   String   @db.Text
+  resourceId String?  @map("resource_id") @db.Uuid
+  metadata   Json?    @db.JsonB
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([resource, resourceId])
+  @@index([actorId, createdAt])
+  @@map("audit_logs")
+}
+
+/// idempotency_keys — used by ride-request + payment endpoints.
+/// Rows expire via a TTL job (Phase 1+).
+model IdempotencyKey {
+  key          String   @id @db.Text
+  scope        String   @db.Text
+  userId       String?  @map("user_id") @db.Uuid
+  responseBody Json?    @map("response_body") @db.JsonB
+  statusCode   Int?     @map("status_code")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz()
+
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+/// auth_sessions — one row per refresh token issued.
+///
+/// Rotation: each refresh creates a NEW row in the same `familyId` and marks
+/// the previous row revoked. If a refresh token whose `revokedAt` is set is
+/// ever presented again ("token reuse"), the entire family is revoked — that
+/// covers the case where an attacker stole a refresh token and rotated it
+/// before the legitimate client noticed.
+model AuthSession {
+  id                String    @id @default(uuid()) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  familyId          String    @map("family_id") @db.Uuid
+  refreshTokenHash  String    @unique @map("refresh_token_hash") @db.Text
+  deviceLabel       String?   @map("device_label") @db.Text
+  ip                String?   @db.Text
+  userAgent         String?   @map("user_agent") @db.Text
+  surface           String    @db.Text // 'mobile' | 'admin-web'
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  expiresAt         DateTime  @map("expires_at") @db.Timestamptz()
+  revokedAt         DateTime? @map("revoked_at") @db.Timestamptz()
+  revokedReason     String?   @map("revoked_reason") @db.Text
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([familyId])
+  @@map("auth_sessions")
+}
+
+/// otp_attempts — audit + brute-force defense.
+/// Phone is stored hashed to keep raw PII out of this table.
+model OtpAttempt {
+  id        String   @id @default(uuid()) @db.Uuid
+  phoneHash String   @map("phone_hash") @db.Text
+  ip        String?  @db.Text
+  succeeded Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  @@index([phoneHash, createdAt])
+  @@index([ip, createdAt])
+  @@map("otp_attempts")
+}
+
+/// rides — the ride lifecycle (Phase 3 booking flow).
+///
+/// `status` is TEXT (validated by zod / the RideStatus union, not a DB enum) so
+/// the state machine can evolve without a DB migration per state. pickup/dropoff
+/// are stored as plain lat/lng floats for now; a PostGIS geography column for
+/// spatial driver-matching lands with the matching module.
+model Ride {
+  id              String    @id @default(uuid()) @db.Uuid
+  riderId         String    @map("rider_id") @db.Uuid
+  driverId        String?   @map("driver_id") @db.Uuid
+  status          String    @default("requested") @db.Text
+  rideClass       String    @default("standard") @map("ride_class") @db.Text
+  pickupLat       Float     @map("pickup_lat")
+  pickupLng       Float     @map("pickup_lng")
+  dropoffLat      Float     @map("dropoff_lat")
+  dropoffLng      Float     @map("dropoff_lng")
+  pickupAddress   String    @map("pickup_address") @db.Text
+  dropoffAddress  String    @map("dropoff_address") @db.Text
+  distanceMeters  Int       @map("distance_meters")
+  durationSeconds Int       @map("duration_seconds")
+  fareCents       Int?      @map("fare_cents")
+  currency        String    @default("CAD") @db.Text
+  cancelReason    String?   @map("cancel_reason") @db.Text
+  // Phase 3 — lifecycle timestamps, one per stage of the trip.
+  searchingAt          DateTime? @map("searching_at") @db.Timestamptz()
+  acceptedAt           DateTime? @map("accepted_at") @db.Timestamptz()
+  arrivedAt            DateTime? @map("arrived_at") @db.Timestamptz()
+  startedAt            DateTime? @map("started_at") @db.Timestamptz()
+  cancelledAt          DateTime? @map("cancelled_at") @db.Timestamptz()
+  cancelledBy          String?   @map("cancelled_by") @db.Text
+  /// 4-digit code the rider reads to the driver. Never sent to the driver.
+  pickupOtp            String?   @map("pickup_otp") @db.Text
+  actualDistanceMeters Int?      @map("actual_distance_meters")
+  vehicleId            String?   @map("vehicle_id") @db.Uuid
+  /// How many dispatch waves this ride has been through.
+  dispatchRound        Int       @default(0) @map("dispatch_round")
+  requestedAt     DateTime  @default(now()) @map("requested_at") @db.Timestamptz()
+  completedAt     DateTime? @map("completed_at") @db.Timestamptz()
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  rider   User           @relation("RiderRides", fields: [riderId], references: [id], onDelete: Cascade)
+  driver  DriverProfile? @relation("DriverRides", fields: [driverId], references: [userId], onDelete: SetNull)
+  vehicle Vehicle?       @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  offers  RideOffer[]
+
+  @@index([riderId, requestedAt])
+  @@index([status])
+  @@index([driverId])
+  @@map("rides")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — drivers, vehicles, KYC documents, availability.
+//
+// `driver_locations` is intentionally absent: it is a partitioned parent with a
+// geography column, neither of which Prisma can express. GeoService reads and
+// writes it through $queryRaw. See migrations/00000000000003_drivers.
+// ---------------------------------------------------------------------------
+
+/// One row per user who has applied to drive. `userId` IS the user id — a
+/// driver is a user with a profile, not a separate identity.
+model DriverProfile {
+  userId           String    @id @map("user_id") @db.Uuid
+  kycStatus        String    @default("not_started") @map("kyc_status") @db.Text
+  licenceNumber    String?   @map("licence_number") @db.Text
+  licenceProvince  String?   @map("licence_province") @db.Text
+  licenceExpiresAt DateTime? @map("licence_expires_at") @db.Timestamptz()
+  ratingSum        Int       @default(0) @map("rating_sum")
+  ratingCount      Int       @default(0) @map("rating_count")
+  totalRides       Int       @default(0) @map("total_rides")
+  appliedAt        DateTime? @map("applied_at") @db.Timestamptz()
+  submittedAt      DateTime? @map("submitted_at") @db.Timestamptz()
+  approvedAt       DateTime? @map("approved_at") @db.Timestamptz()
+  approvedById     String?   @map("approved_by") @db.Uuid
+  rejectionReason  String?   @map("rejection_reason") @db.Text
+  suspendedAt      DateTime? @map("suspended_at") @db.Timestamptz()
+  suspensionReason String?   @map("suspension_reason") @db.Text
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  user         User                @relation("DriverProfileUser", fields: [userId], references: [id], onDelete: Cascade)
+  approvedBy   User?               @relation("DriverApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  vehicles     Vehicle[]
+  documents    DriverDocument[]
+  availability DriverAvailability?
+  rides        Ride[]              @relation("DriverRides")
+  offers       RideOffer[]
+
+  @@index([kycStatus, submittedAt])
+  @@map("driver_profiles")
+}
+
+model Vehicle {
+  id              String   @id @default(uuid()) @db.Uuid
+  driverId        String   @map("driver_id") @db.Uuid
+  make            String   @db.Text
+  model           String   @db.Text
+  year            Int
+  color           String   @db.Text
+  plate           String   @db.Text
+  province        String   @db.Text
+  rideClass       String   @default("standard") @map("ride_class") @db.Text
+  seats           Int      @default(4)
+  status          String   @default("pending") @db.Text
+  rejectionReason String?  @map("rejection_reason") @db.Text
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  driver       DriverProfile        @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+  availability DriverAvailability[]
+  rides        Ride[]
+
+  @@unique([plate, province])
+  @@index([driverId])
+  @@map("vehicles")
+}
+
+/// A KYC upload awaiting human review. At most one live row per
+/// (driver, type) — re-uploading replaces the previous row.
+model DriverDocument {
+  id              String    @id @default(uuid()) @db.Uuid
+  driverId        String    @map("driver_id") @db.Uuid
+  type            String    @db.Text
+  status          String    @default("pending") @db.Text
+  storageKey      String    @map("storage_key") @db.Text
+  fileName        String    @map("file_name") @db.Text
+  mimeType        String    @map("mime_type") @db.Text
+  sizeBytes       Int       @map("size_bytes")
+  contentSha256   String?   @map("content_sha256") @db.Text
+  expiresAt       DateTime? @map("expires_at") @db.Timestamptz()
+  rejectionReason String?   @map("rejection_reason") @db.Text
+  reviewedById    String?   @map("reviewed_by") @db.Uuid
+  reviewedAt      DateTime? @map("reviewed_at") @db.Timestamptz()
+  uploadedAt      DateTime  @default(now()) @map("uploaded_at") @db.Timestamptz()
+
+  driver     DriverProfile @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+  reviewedBy User?         @relation("DocumentReviewedBy", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@unique([driverId, type])
+  @@index([status, uploadedAt])
+  @@map("driver_documents")
+}
+
+/// The dispatcher's view of who can take a ride. Written on every location
+/// ping, so it is kept out of driver_profiles to avoid bloating that table.
+model DriverAvailability {
+  driverId       String    @id @map("driver_id") @db.Uuid
+  status         String    @default("offline") @db.Text
+  vehicleId      String?   @map("vehicle_id") @db.Uuid
+  /// geography(Point, 4326) — Prisma has no native type, so it is declared
+  /// Unsupported to keep it in the schema without Prisma trying to manage it.
+  /// Read and written via $queryRaw in GeoService.
+  lastLocation   Unsupported("geography(Point, 4326)")? @map("last_location")
+  headingDegrees Float?    @map("heading_degrees") @db.Real
+  speedMps       Float?    @map("speed_mps") @db.Real
+  lastPingAt     DateTime? @map("last_ping_at") @db.Timestamptz()
+  currentRideId  String?   @map("current_ride_id") @db.Uuid
+  wentOnlineAt   DateTime? @map("went_online_at") @db.Timestamptz()
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  driver  DriverProfile @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+  vehicle Vehicle?      @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+
+  @@index([status, lastPingAt])
+  @@map("driver_availability")
+}
+
+/// One dispatch offer to one driver.
+///
+/// Durable rather than a Redis TTL key: acceptance rate and decline reasons
+/// drive driver ranking and deactivation decisions, which need a record that
+/// outlives the offer. `ride_events` is intentionally absent from this schema —
+/// it is a partitioned parent, which Prisma cannot express; RidesService writes
+/// it via $executeRaw. See migrations/00000000000005_dispatch.
+model RideOffer {
+  id             String    @id @default(uuid()) @db.Uuid
+  rideId         String    @map("ride_id") @db.Uuid
+  driverId       String    @map("driver_id") @db.Uuid
+  round          Int       @default(1)
+  status         String    @default("pending") @db.Text
+  distanceMeters Int       @map("distance_meters")
+  etaSeconds     Int       @map("eta_seconds")
+  offeredAt      DateTime  @default(now()) @map("offered_at") @db.Timestamptz()
+  expiresAt      DateTime  @map("expires_at") @db.Timestamptz()
+  respondedAt    DateTime? @map("responded_at") @db.Timestamptz()
+  declineReason  String?   @map("decline_reason") @db.Text
+
+  ride   Ride          @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  driver DriverProfile @relation(fields: [driverId], references: [userId], onDelete: Cascade)
+
+  @@unique([rideId, driverId, round])
+  @@index([driverId, offeredAt])
+  @@index([expiresAt])
+  @@map("ride_offers")
+}
+
+/// A place a rider hearted. At most one `home` and one `work` per rider,
+/// enforced by partial unique indexes in migration 0008.
+model SavedPlace {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  kind      String   @default("other") @db.Text
+  name      String   @db.Text
+  address   String   @db.Text
+  lat       Float
+  lng       Float
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("saved_places")
+}

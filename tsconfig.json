@@ -1,0 +1,16 @@
+{
+  "extends": "@uride/config/tsconfig/nestjs.json",
+  "compilerOptions": {
+    "baseUrl": "./",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+    "outDir": "./dist",
+    // No rootDir so tests can live in /test alongside /src. Production build
+    // uses tsconfig.build.json which excludes /test.
+    "rootDir": "./",
+    "types": ["node", "jest"]
+  },
+  "include": ["src/**/*", "test/**/*", "scripts/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
