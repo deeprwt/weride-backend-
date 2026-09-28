@@ -66,6 +66,9 @@ function parseArgs(argv: string[]): Args {
       case '-h':
         printHelp();
         process.exit(0);
+        // Unreachable — process.exit does not return. Present so the next case
+        // is not read as a fallthrough, which would hide a real one later.
+        break;
       default:
         die(`unknown arg: ${a}`);
     }
