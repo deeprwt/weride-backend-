@@ -3,9 +3,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
-  PayloadTooLargeException,
   ServiceUnavailableException,
-  UnsupportedMediaTypeException,
   type OnModuleInit,
 } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
@@ -13,34 +11,14 @@ import { createReadStream } from 'node:fs';
 import { mkdir, open, realpath, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
-import { DRIVER_DOCUMENT_MAX_BYTES } from '@uride/validation';
 import {
   DocumentStorage,
-  isAllowedMimeType,
-  normalizeMimeType,
-  sniffMimeType,
-  type DocumentMimeType,
   type DocumentStat,
   type PutDocumentInput,
   type StoredDocument,
 } from './document-storage.interface';
+import { KEY_PATTERN, newStorageKey, verifyDocument } from './document-content';
 import { loadEnv } from '../../config/env';
-
-/** File extension per accepted type, so a key is self-describing on disk for ops. */
-const EXTENSION: Record<DocumentMimeType, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
-  'application/pdf': 'pdf',
-};
-
-/**
- * The only shape a storage key may take: `ab/cd/<32 hex>.<ext>`. Anything else
- * — an absolute path, `..`, a backslash, a NUL byte, a UNC prefix — fails this
- * test before it ever reaches the filesystem. The two-level fan-out keeps any
- * single directory to a few thousand entries at fleet scale.
- */
-const KEY_PATTERN = /^[0-9a-f]{2}\/[0-9a-f]{2}\/[0-9a-f]{32}\.(?:jpg|png|webp|pdf)$/;
 
 /** Staging area for half-written uploads. Unreachable via KEY_PATTERN, so never served. */
 const TMP_DIR = '.tmp';
@@ -49,7 +27,6 @@ const TMP_DIR = '.tmp';
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 
-const MAX_MEGABYTES = Math.floor(DRIVER_DOCUMENT_MAX_BYTES / (1024 * 1024));
 
 /**
  * LocalDiskDocumentStorage — the free, offline-capable driver used through
@@ -83,7 +60,7 @@ export class LocalDiskDocumentStorage extends DocumentStorage implements OnModul
   }
 
   async put(input: PutDocumentInput): Promise<StoredDocument> {
-    const mimeType = this.verify(input);
+    const mimeType = verifyDocument(input, this.logger);
 
     const sizeBytes = input.bytes.byteLength;
     const contentSha256 = createHash('sha256').update(input.bytes).digest('hex');
@@ -159,53 +136,6 @@ export class LocalDiskDocumentStorage extends DocumentStorage implements OnModul
   // -------------------------------------------------------------------------
 
   /**
-   * Size, allow-list and content checks, cheapest first. Returns the sniffed
-   * type, which is the only type the caller is allowed to persist.
-   */
-  private verify(input: PutDocumentInput): DocumentMimeType {
-    const sizeBytes = input.bytes.byteLength;
-    if (sizeBytes === 0) {
-      throw new BadRequestException({
-        code: 'document_empty',
-        message: 'The uploaded file is empty.',
-      });
-    }
-    if (sizeBytes > DRIVER_DOCUMENT_MAX_BYTES) {
-      throw new PayloadTooLargeException({
-        code: 'document_too_large',
-        message: `Documents must be ${MAX_MEGABYTES} MB or smaller.`,
-      });
-    }
-
-    const declared = normalizeMimeType(input.declaredMimeType);
-    if (!isAllowedMimeType(declared)) {
-      throw new UnsupportedMediaTypeException({
-        code: 'document_type_not_allowed',
-        message: 'Documents must be a JPEG, PNG, WebP or PDF file.',
-      });
-    }
-
-    const sniffed = sniffMimeType(input.bytes);
-    if (!sniffed) {
-      throw new UnsupportedMediaTypeException({
-        code: 'document_unreadable',
-        message: 'The file is not a readable JPEG, PNG, WebP or PDF.',
-      });
-    }
-    // The mismatch case is the interesting one: a renamed executable, or an
-    // HTML page posted as image/jpeg. Refuse instead of quietly trusting the
-    // sniff, so the attempt shows up in the logs.
-    if (sniffed !== declared) {
-      this.logger.warn(`document content mismatch declared=${declared} sniffed=${sniffed}`);
-      throw new UnsupportedMediaTypeException({
-        code: 'document_content_mismatch',
-        message: 'The file contents do not match its declared type.',
-      });
-    }
-    return sniffed;
-  }
-
-  /**
    * Resolve a key to an absolute path, refusing anything that could escape the
    * storage root. KEY_PATTERN already excludes traversal sequences; the
    * containment check stays as a second, explicit barrier because this is the
@@ -261,15 +191,6 @@ export class LocalDiskDocumentStorage extends DocumentStorage implements OnModul
       });
     }
   }
-}
-
-/**
- * 128 bits of randomness, fanned out over two directory levels taken from the
- * key itself so the path stays derivable from the key and nothing else.
- */
-function newStorageKey(mimeType: DocumentMimeType): string {
-  const id = randomBytes(16).toString('hex');
-  return `${id.slice(0, 2)}/${id.slice(2, 4)}/${id}.${EXTENSION[mimeType]}`;
 }
 
 async function statOrNull(absolutePath: string): Promise<{ size: number; mtime: Date } | null> {

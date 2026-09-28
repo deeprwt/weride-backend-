@@ -1,0 +1,13 @@
+# Nixpacks build (Dokploy). Mirrors the Dockerfile's build order:
+#   1. prisma generate  — src imports types from '@prisma/client'
+#   2. build:standalone — builds vendored @uride/types + @uride/validation
+#      (their dist/ is gitignored) before `nest build`. Plain `npm run build`
+#      skips step 2 and fails with TS2307 on every @uride/* import.
+[variables]
+NIXPACKS_NODE_VERSION = "22"
+
+[phases.build]
+cmds = ["npx prisma generate", "npm run build:standalone"]
+
+[start]
+cmd = "npm run start"

@@ -87,11 +87,21 @@ const EnvSchema = z.object({
   PRICING_TIMEOUT_MS: z.coerce.number().int().positive().default(2000),
 
   // ---- Driver document storage (Phase 2) ----
-  // 'local' writes to DOCUMENT_STORAGE_PATH on disk — zero cost, works offline.
-  // 's3' is the production driver; it is deliberately not implemented yet so a
-  // half-configured bucket can never silently swallow KYC uploads.
-  DOCUMENT_STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
+  // 'local' writes to DOCUMENT_STORAGE_PATH on disk — zero cost, works offline,
+  // and is the right choice for development only: a container filesystem is
+  // ephemeral, so a deployed 'local' loses every KYC document on redeploy.
+  // 'supabase' is the deployed driver, writing to a PRIVATE Supabase bucket.
+  // 's3' remains unimplemented so a half-configured bucket can never silently
+  // swallow KYC uploads.
+  DOCUMENT_STORAGE_DRIVER: z.enum(['local', 'supabase', 's3']).default('local'),
   DOCUMENT_STORAGE_PATH: z.string().default('./var/documents'),
+
+  // Required when DOCUMENT_STORAGE_DRIVER=supabase. The bucket must exist and
+  // must be PRIVATE — the service-role key bypasses RLS, so the bucket's own
+  // public flag is the only thing standing between a licence scan and the open
+  // internet.
+  SUPABASE_STORAGE_BUCKET: z.string().default('driver-documents'),
+  SUPABASE_STORAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
 
   // ---- Driver availability / dispatch tuning (Phase 2) ----
   // A driver whose last ping is older than this is invisible to dispatch.
@@ -352,8 +362,32 @@ function enforceStorageDriverSupported(env: Env): void {
   if (env.DOCUMENT_STORAGE_DRIVER === 's3') {
     throw new Error(
       '[uride-api] DOCUMENT_STORAGE_DRIVER=s3 is not implemented yet. ' +
-        'Use DOCUMENT_STORAGE_DRIVER=local.',
+        'Use DOCUMENT_STORAGE_DRIVER=supabase for object storage, or =local for development.',
     );
+  }
+
+  if (env.DOCUMENT_STORAGE_DRIVER === 'supabase') {
+    if (!env.SUPABASE_URL) {
+      throw new Error(
+        '[uride-api] DOCUMENT_STORAGE_DRIVER=supabase requires SUPABASE_URL ' +
+          '(e.g. https://<ref>.supabase.co).',
+      );
+    }
+    if (!env.SUPABASE_SERVICE_ROLE_KEY) {
+      throw new Error(
+        '[uride-api] DOCUMENT_STORAGE_DRIVER=supabase requires SUPABASE_SERVICE_ROLE_KEY. ' +
+          'The anon key cannot write to a private bucket.',
+      );
+    }
+    // A service-role key in the wrong field is the one mistake here that fails
+    // open: the anon key is safe to leak and would quietly 403 on every upload,
+    // while the operator believes storage is configured.
+    if (env.SUPABASE_SERVICE_ROLE_KEY === env.SUPABASE_ANON_KEY) {
+      throw new Error(
+        '[uride-api] SUPABASE_SERVICE_ROLE_KEY is set to the anon key. ' +
+          'KYC uploads would fail on every request.',
+      );
+    }
   }
 }
 
