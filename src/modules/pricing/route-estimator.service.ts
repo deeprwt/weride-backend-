@@ -20,22 +20,36 @@ export interface RouteEstimate {
   source: RouteSource;
   /** True when a `google` route was reused from the cache rather than billed now. */
   cached: boolean;
+  /**
+   * Google's encoded polyline for the driven route, or null when the distance
+   * came from the detour estimate — a straight-line guess has no shape to draw.
+   *
+   * Clients decode this to draw the route along real roads. Without it the map
+   * can only join the two pins, which looks broken next to any competitor and,
+   * worse, advertises that the quoted distance is not a road distance.
+   */
+  polyline: string | null;
 }
 
-/** The two numbers a quote needs from a route, nothing else. */
+/** What a quote needs from a route: the two numbers, plus the shape to draw. */
 interface RouteLeg {
   distanceMeters: number;
   durationSeconds: number;
+  polyline: string | null;
 }
 
 const COMPUTE_ROUTES_URL = 'https://routes.googleapis.com/directions/v2:computeRoutes';
 
 /**
- * Ask for exactly the two fields a fare uses. computeRoutes refuses a request
- * with no field mask, and a narrow one keeps the response small — polylines,
- * legs and steps are most of the payload and a quote draws none of them.
+ * Exactly the fields that are used, and no more: computeRoutes refuses a request
+ * with no field mask, and `legs` and `steps` are most of the payload weight.
+ *
+ * The overview polyline is worth its bytes — it is what lets the app draw the
+ * route along roads instead of a straight line between the pins. It does not
+ * change the billing tier; TRAFFIC_AWARE routing is what sets that.
  */
-const ROUTES_FIELD_MASK = 'routes.distanceMeters,routes.duration';
+const ROUTES_FIELD_MASK =
+  'routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline';
 
 /**
  * Pins are rounded to three decimal places for the cache key: ~111 m of
@@ -157,7 +171,7 @@ export class RouteEstimatorService {
     const durationSeconds = Math.round(
       (distanceMeters / 1000 / this.config.averageSpeedKmh) * 3600,
     );
-    return { distanceMeters, durationSeconds, source: 'estimate', cached: false };
+    return { distanceMeters, durationSeconds, source: 'estimate', cached: false, polyline: null };
   }
 
   private async resolveRoute(
@@ -236,7 +250,7 @@ export class RouteEstimatorService {
     try {
       await this.redis.client.set(
         key,
-        JSON.stringify({ d: leg.distanceMeters, s: leg.durationSeconds }),
+        JSON.stringify({ d: leg.distanceMeters, s: leg.durationSeconds, p: leg.polyline }),
         'EX',
         this.config.cacheTtlSeconds,
       );
@@ -286,17 +300,31 @@ function parseComputeRoutesResponse(body: unknown): RouteLeg {
   const seconds = match?.[1] === undefined ? Number.NaN : Number(match[1]);
   if (!Number.isFinite(seconds)) throw new Error('Routes API returned an invalid duration');
 
-  return { distanceMeters: Math.round(distance), durationSeconds: Math.round(seconds) };
+  // Geometry is best-effort: a route with a usable distance but a missing or
+  // malformed polyline should still produce a fare. The map falls back to a
+  // straight line for that one trip rather than the whole quote failing over
+  // a decoration.
+  const encoded = isRecord(route.polyline) ? route.polyline.encodedPolyline : undefined;
+  const polyline = typeof encoded === 'string' && encoded.length > 0 ? encoded : null;
+
+  return {
+    distanceMeters: Math.round(distance),
+    durationSeconds: Math.round(seconds),
+    polyline,
+  };
 }
 
 function parseCachedLeg(raw: string): RouteLeg | null {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!isRecord(parsed)) return null;
-    const { d, s } = parsed;
+    const { d, s, p } = parsed;
     if (typeof d !== 'number' || typeof s !== 'number') return null;
     if (!Number.isFinite(d) || !Number.isFinite(s) || d < 0 || s < 0) return null;
-    return { distanceMeters: d, durationSeconds: s };
+    // `p` is absent on entries written before geometry was cached. Those are
+    // still perfectly good distances, so serve them with no shape rather than
+    // discarding the cache and re-billing every trip in the city at once.
+    return { distanceMeters: d, durationSeconds: s, polyline: typeof p === 'string' ? p : null };
   } catch {
     return null;
   }

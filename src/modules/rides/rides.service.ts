@@ -168,7 +168,12 @@ export class RidesService {
 
   /** Fare estimate — no DB write, and deliberately no demand recorded. */
   async quote(input: QuoteRequestInput): Promise<FareQuote> {
-    return this.pricing.quote(input, await this.pricingInputsFor(input.pickup, input.dropoff));
+    const { polyline, ...inputs } = await this.pricingInputsFor(input.pickup, input.dropoff);
+    const fare = await this.pricing.quote(input, inputs);
+    // Attached here rather than inside PricingClient: the polyline is the route
+    // this fare was priced on, and it must not survive the local-fallback path
+    // where the distance is a guess and there is no route to show.
+    return { ...fare, routePolyline: polyline };
   }
 
   /**
@@ -189,7 +194,7 @@ export class RidesService {
   private async pricingInputsFor(
     pickup: { lat: number; lng: number },
     dropoff: { lat: number; lng: number },
-  ): Promise<PricingInputs> {
+  ): Promise<PricingInputs & { polyline: string | null }> {
     const [surgeMultiplier, route] = await Promise.all([
       this.surge.multiplierFor(pickup.lat, pickup.lng),
       this.routes.estimate(pickup, dropoff),
@@ -198,6 +203,7 @@ export class RidesService {
       surgeMultiplier,
       distanceMeters: route.distanceMeters,
       durationSeconds: route.durationSeconds,
+      polyline: route.polyline,
     };
   }
 

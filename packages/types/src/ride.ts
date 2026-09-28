@@ -90,4 +90,12 @@ export interface FareQuote {
   fareCents: Cents;
   surgeMultiplier: number;
   breakdown: FareBreakdown;
+  /**
+   * Google-encoded polyline of the road route this fare was priced on, or null
+   * when the distance came from the straight-line detour estimate.
+   *
+   * Optional on the wire so an older client ignores it and a newer client
+   * against an older API simply draws the straight line it always drew.
+   */
+  routePolyline?: string | null;
 }
