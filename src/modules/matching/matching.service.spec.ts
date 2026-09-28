@@ -6,6 +6,7 @@ import type { RideEventsService } from '../rides/ride-events.service';
 import type { PrismaService } from '../../common/prisma/prisma.module';
 import type { RedisService } from '../../common/redis/redis.module';
 import type { GeoService } from '../geo/geo.service';
+import type { RouteEstimatorService } from '../pricing/route-estimator.service';
 import type { H3DriverIndexService, NearbyIndexedDriver } from '../geo/h3-driver-index.service';
 import { _resetEnvCache } from '../../config/env';
 
@@ -59,6 +60,7 @@ const OFFER_ID = '77777777-7777-4777-8777-777777777777';
 const DECLINER_ID = '55555555-5555-4555-8555-555555555555';
 const DRIVER_B_ID = '66666666-6666-4666-8666-666666666666';
 const DRIVER_C_ID = '88888888-8888-4888-8888-888888888888';
+const DRIVER_D_ID = '99999999-9999-4999-8999-999999999999';
 const LOSER_OFFER_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const LOSER_DRIVER_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
@@ -77,6 +79,7 @@ describe('MatchingService', () => {
   let geo: { distanceMeters: Mock };
   let index: { searchNearby: Mock; setStatus: Mock };
   let events: { append: Mock };
+  let routes: { estimate: Mock; estimateMatrix: Mock };
   let service: MatchingService;
 
   /** What the pacing read sees; each case sets the round it is simulating. */
@@ -202,12 +205,39 @@ describe('MatchingService', () => {
       setStatus: jest.fn().mockResolvedValue(undefined),
     };
     events = { append: jest.fn().mockResolvedValue(undefined) };
+    // Stubbed to the detour-factor arithmetic the service used before routing
+    // existed, so these tests keep asserting dispatch behaviour rather than
+    // Google's answer. `estimate` never throws in production either.
+    routes = {
+      // Default: road time tracks straight-line order, so every existing test
+      // keeps the ranking it was written against. The river test overrides it.
+      estimateMatrix: jest.fn().mockImplementation((origins: { lat: number }[]) =>
+        Promise.resolve(
+          origins.map((_, originIndex) => ({
+            originIndex,
+            distanceMeters: 1000,
+            durationSeconds: 100 + originIndex,
+            routed: true,
+          })),
+        ),
+      ),
+      estimate: jest.fn().mockImplementation(() =>
+        Promise.resolve({
+          distanceMeters: 0,
+          durationSeconds: 60,
+          source: 'estimate' as const,
+          cached: false,
+          polyline: null,
+        }),
+      ),
+    };
 
     service = new MatchingService(
       prisma as unknown as PrismaService,
       geo as unknown as GeoService,
       index as unknown as H3DriverIndexService,
       redis as unknown as RedisService,
+      routes as unknown as RouteEstimatorService,
       // The real state machine over a stubbed log, exactly as MatchingModule
       // binds RIDE_STATE_PORT: an illegal edge has to fail here as it would in
       // production.
@@ -354,9 +384,16 @@ describe('MatchingService', () => {
       ]);
 
       // The ETA the rider is shown is recomputed from where the driver was when
-      // they tapped accept, not from the estimate the wave made a whole TTL ago.
+      // they tapped accept, not from the estimate the wave made a whole TTL ago
+      // — and it is a ROUTED duration, not straight-line arithmetic, because
+      // "4 minutes away" is a promise and a driver across a river is not four
+      // minutes away however short the crow's flight is.
+      expect(routes.estimate).toHaveBeenCalledWith(
+        { lat: 43.65, lng: -79.38 },
+        { lat: 43.6532, lng: -79.3832 },
+      );
       expect(acceptance.pickupDistanceMeters).toBe(640);
-      expect(acceptance.pickupEtaSeconds).toBe(100);
+      expect(acceptance.pickupEtaSeconds).toBe(60);
       expect(acceptance.vehicleId).toBe(VEHICLE_ID);
     });
 
@@ -629,6 +666,87 @@ describe('MatchingService', () => {
       expect(sql).toContain('"is_active"');
       expect(sql).toContain(`a."status" = 'online'`);
       expect(sql).toContain('ANY(');
+    });
+
+    it('offers the drivers who are closest by ROAD, not by straight line', async () => {
+      // The river case, with one more candidate than the wave can ask, so the
+      // ordering actually decides who is left out:
+      //
+      //   DRIVER_B  3.0 km straight, wrong bank    -> 900 s by road
+      //   DRIVER_C  3.5 km straight, by the bridge  -> 400 s by road
+      //   DRIVER_D  4.0 km straight                 -> 500 s by road
+      //
+      // Straight-line takes the two nearest, B and C, and the rider may end up
+      // with B — ten minutes of driving around the water. On road time the wave
+      // asks C and D, and B is correctly dropped despite being nearest.
+      currentRoundOffers = [{ status: 'expired' }];
+      index.searchNearby.mockResolvedValue([
+        nearbyDriver(DRIVER_B_ID, 3_000),
+        nearbyDriver(DRIVER_C_ID, 3_500),
+        nearbyDriver(DRIVER_D_ID, 4_000),
+      ]);
+      routes.estimateMatrix.mockResolvedValue([
+        { originIndex: 0, distanceMeters: 10_000, durationSeconds: 900, routed: true },
+        { originIndex: 1, distanceMeters: 7_000, durationSeconds: 400, routed: true },
+        { originIndex: 2, distanceMeters: 7_500, durationSeconds: 500, routed: true },
+      ]);
+
+      await service.dispatch(RIDE_ID);
+
+      const rows = createManyArgs(tx);
+      expect(rows.map((row) => row.driverId)).toEqual([DRIVER_C_ID, DRIVER_D_ID]);
+      // The offer carries the ROAD numbers, so a driver is told the distance
+      // they will actually drive rather than the crow's flight.
+      expect(rows[0].distanceMeters).toBe(7_000);
+      expect(rows[0].etaSeconds).toBe(400);
+    });
+
+    it('routes the ETA even when every candidate will be asked anyway', async () => {
+      // Two drivers, two slots: ranking cannot change WHO is asked. The numbers
+      // on the offer still must be road numbers, because that is what a driver
+      // reads before accepting — told "4 minutes" for a drive around a river,
+      // they accept a job they would have declined.
+      currentRoundOffers = [{ status: 'expired' }];
+      index.searchNearby.mockResolvedValue([
+        nearbyDriver(DRIVER_B_ID, 3_000),
+        nearbyDriver(DRIVER_C_ID, 3_500),
+      ]);
+      routes.estimateMatrix.mockResolvedValue([
+        { originIndex: 0, distanceMeters: 10_000, durationSeconds: 900, routed: true },
+        { originIndex: 1, distanceMeters: 4_100, durationSeconds: 300, routed: true },
+      ]);
+
+      await service.dispatch(RIDE_ID);
+
+      expect(routes.estimateMatrix).toHaveBeenCalled();
+      const rows = createManyArgs(tx);
+      // Both asked, but ordered and described by road, not crow's flight.
+      expect(rows.map((row) => row.driverId)).toEqual([DRIVER_C_ID, DRIVER_B_ID]);
+      expect(rows.map((row) => row.etaSeconds)).toEqual([300, 900]);
+      expect(rows.map((row) => row.distanceMeters)).toEqual([4_100, 10_000]);
+    });
+
+    it('keeps the straight-line order when nothing routes', async () => {
+      // A maps outage must cost accuracy, never a dispatch: the wave still goes
+      // out, ordered the way it was before road ranking existed.
+      currentRoundOffers = [{ status: 'expired' }];
+      index.searchNearby.mockResolvedValue([
+        nearbyDriver(DRIVER_B_ID, 3_000),
+        nearbyDriver(DRIVER_C_ID, 3_500),
+        nearbyDriver(DRIVER_D_ID, 4_000),
+      ]);
+      routes.estimateMatrix.mockResolvedValue([
+        { originIndex: 0, distanceMeters: 6_500, durationSeconds: 780, routed: false },
+        { originIndex: 1, distanceMeters: 7_800, durationSeconds: 936, routed: false },
+        { originIndex: 2, distanceMeters: 9_100, durationSeconds: 1_092, routed: false },
+      ]);
+
+      await service.dispatch(RIDE_ID);
+
+      expect(createManyArgs(tx).map((row) => row.driverId)).toEqual([
+        DRIVER_B_ID,
+        DRIVER_C_ID,
+      ]);
     });
 
     it('searches a larger pool when the filters leave the wave short', async () => {
@@ -940,6 +1058,8 @@ interface OfferInsert {
   round: number;
   status: string;
   distanceMeters: number;
+  /** Routed when road ranking produced it, detour-factor estimate otherwise. */
+  etaSeconds: number;
 }
 
 function createManyArgs(tx: TxMock): OfferInsert[] {

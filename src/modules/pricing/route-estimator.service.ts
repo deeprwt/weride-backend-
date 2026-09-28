@@ -9,13 +9,26 @@ export interface RoutePoint {
   lng: number;
 }
 
+/** One origin's road cost to the shared destination. */
+export interface RouteMatrixLeg {
+  /** Index into the origins array as passed in. */
+  originIndex: number;
+  distanceMeters: number;
+  durationSeconds: number;
+  /** False when this origin fell back to the straight-line estimate. */
+  routed: boolean;
+}
+
 /** `google` is a routed road distance; `estimate` is straight-line times the detour factor. */
 export type RouteSource = 'google' | 'estimate';
 
 export interface RouteEstimate {
   /** Road metres, integer. */
   distanceMeters: number;
-  /** Seconds, integer. Traffic-aware when the source is `google`. */
+  /**
+   * Seconds, integer. Congestion-aware only when the source is `google` AND
+   * ROUTE_TRAFFIC_AWARE is on; otherwise it is a free-flow estimate.
+   */
   durationSeconds: number;
   source: RouteSource;
   /** True when a `google` route was reused from the cache rather than billed now. */
@@ -39,6 +52,16 @@ interface RouteLeg {
 }
 
 const COMPUTE_ROUTES_URL = 'https://routes.googleapis.com/directions/v2:computeRoutes';
+const COMPUTE_MATRIX_URL =
+  'https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix';
+
+/**
+ * Matrix replies carry the origin index, so a missing or failed element can be
+ * told apart from one that simply routed to zero. `condition` distinguishes
+ * ROUTE_EXISTS from ROUTE_NOT_FOUND — an island, a closed crossing — which must
+ * fall back rather than be read as "zero seconds away".
+ */
+const MATRIX_FIELD_MASK = 'originIndex,duration,distanceMeters,condition';
 
 /**
  * Exactly the fields that are used, and no more: computeRoutes refuses a request
@@ -77,12 +100,15 @@ const DURATION_PATTERN = /^(\d+(?:\.\d+)?)s$/;
  *
  * Straight-line distance under-quotes every trip that is not a straight line,
  * which is every trip. With MAPS_PROVIDER=google this asks the Routes API
- * (computeRoutes, TRAFFIC_AWARE) for the real road distance and a duration that
- * knows about rush hour. With MAPS_PROVIDER=none it multiplies straight-line
- * distance by ROUTE_DETOUR_FACTOR, so local development costs nothing.
+ * (computeRoutes) for the real road distance and duration. With
+ * MAPS_PROVIDER=none it multiplies straight-line distance by
+ * ROUTE_DETOUR_FACTOR, so local development costs nothing.
  *
  * Google is BILLABLE, and traffic-aware routing bills at a higher tier than
- * static routing (see docs/RUNBOOK.md §cost). The spend is bounded three ways:
+ * static routing (see docs/RUNBOOK.md §cost), which is why ROUTE_TRAFFIC_AWARE
+ * defaults off: the congestion-aware duration is the only thing it buys, and
+ * distance — which dominates the fare — is identical on the cheaper tier. The
+ * spend is bounded three ways:
  *
  *  - Once per QUOTE, never per location frame. Live ETAs during a trip are
  *    computed in memory from the driver's position; nothing on that path may
@@ -165,6 +191,91 @@ export class RouteEstimatorService {
     return lookup;
   }
 
+  /**
+   * Road cost from many origins to one destination, in a single call.
+   *
+   * This exists for dispatch. Ranking candidate drivers by straight-line
+   * distance gets the river case wrong: a driver 5 km away on the far bank is
+   * 10 km by road, while one 6 km away beside the bridge is 7 km. Straight-line
+   * offers the ride to the first driver, the rider waits longer, and the driver
+   * makes a long dead leg — so the shortlist has to be re-ranked on real road
+   * time before offers go out.
+   *
+   * One batched request for the whole shortlist, not one per driver: the matrix
+   * endpoint bills per origin-destination element, so N origins in one call
+   * costs the same elements as N calls but one round trip of latency, inside a
+   * dispatch tick where latency is the budget.
+   *
+   * Never throws and never partially fails: any origin Google could not route —
+   * and every origin if the call itself fails — comes back on the detour
+   * estimate, flagged `routed: false`. Dispatch degrades to the ordering it
+   * used before rather than stalling because a maps provider is slow.
+   */
+  async estimateMatrix(
+    origins: readonly RoutePoint[],
+    destination: RoutePoint,
+  ): Promise<RouteMatrixLeg[]> {
+    const fallback = (): RouteMatrixLeg[] =>
+      origins.map((origin, originIndex) => {
+        const approx = this.approximate(haversineMeters(origin, destination));
+        return {
+          originIndex,
+          distanceMeters: approx.distanceMeters,
+          durationSeconds: approx.durationSeconds,
+          routed: false,
+        };
+      });
+
+    if (this.breaker === null || origins.length === 0) return fallback();
+
+    let response: Response;
+    try {
+      response = await fetch(COMPUTE_MATRIX_URL, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': this.config.googleApiKey ?? '',
+          'x-goog-fieldmask': MATRIX_FIELD_MASK,
+        },
+        body: JSON.stringify({
+          origins: origins.map((o) => ({ waypoint: waypoint(o) })),
+          destinations: [{ waypoint: waypoint(destination) }],
+          travelMode: 'DRIVE',
+          routingPreference: this.config.trafficAware ? 'TRAFFIC_AWARE' : 'TRAFFIC_UNAWARE',
+        }),
+        signal: AbortSignal.timeout(this.config.timeoutMs),
+      });
+    } catch (error) {
+      this.logger.warn(`Route matrix failed, ranking on estimates: ${describeError(error)}`);
+      return fallback();
+    }
+
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      this.logger.warn(`Route matrix responded ${response.status}; ranking on estimates.`);
+      return fallback();
+    }
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      return fallback();
+    }
+
+    // Start from the fallback and overwrite what actually routed, so an origin
+    // Google omitted keeps a usable number instead of vanishing from the
+    // ranking — a dropped candidate is a driver who is never asked at all.
+    const legs = fallback();
+    if (!Array.isArray(body)) return legs;
+
+    for (const entry of body) {
+      const parsed = parseMatrixElement(entry, origins.length);
+      if (parsed) legs[parsed.originIndex] = parsed;
+    }
+    return legs;
+  }
+
   /** Straight-line × detour factor, at the configured average speed. */
   private approximate(straightLineMeters: number): RouteEstimate {
     const distanceMeters = Math.round(straightLineMeters * this.config.detourFactor);
@@ -218,7 +329,7 @@ export class RouteEstimatorService {
         origin: waypoint(pickup),
         destination: waypoint(dropoff),
         travelMode: 'DRIVE',
-        routingPreference: 'TRAFFIC_AWARE',
+        routingPreference: this.config.trafficAware ? 'TRAFFIC_AWARE' : 'TRAFFIC_UNAWARE',
         computeAlternativeRoutes: false,
         units: 'METRIC',
       }),
@@ -311,6 +422,42 @@ function parseComputeRoutesResponse(body: unknown): RouteLeg {
     distanceMeters: Math.round(distance),
     durationSeconds: Math.round(seconds),
     polyline,
+  };
+}
+
+/**
+ * One element of a computeRouteMatrix reply.
+ *
+ * Returns null — meaning "keep the fallback for this origin" — for anything
+ * that is not a usable route: an out-of-range index, a missing originIndex, or
+ * a `condition` other than ROUTE_EXISTS. That last one matters: Google reports
+ * an unreachable pair as a successful element with no duration, and reading
+ * that as zero would rank an unreachable driver first.
+ */
+function parseMatrixElement(entry: unknown, originCount: number): RouteMatrixLeg | null {
+  if (!isRecord(entry)) return null;
+
+  // proto3 JSON omits zero-valued scalars, so an absent originIndex is 0.
+  const originIndex = typeof entry.originIndex === 'number' ? entry.originIndex : 0;
+  if (!Number.isInteger(originIndex) || originIndex < 0 || originIndex >= originCount) {
+    return null;
+  }
+
+  const condition = typeof entry.condition === 'string' ? entry.condition : '';
+  if (condition && condition !== 'ROUTE_EXISTS') return null;
+
+  const match = typeof entry.duration === 'string' ? DURATION_PATTERN.exec(entry.duration) : null;
+  const seconds = match?.[1] === undefined ? Number.NaN : Number(match[1]);
+  if (!Number.isFinite(seconds)) return null;
+
+  const distance = entry.distanceMeters ?? 0;
+  if (typeof distance !== 'number' || !Number.isFinite(distance) || distance < 0) return null;
+
+  return {
+    originIndex,
+    distanceMeters: Math.round(distance),
+    durationSeconds: Math.round(seconds),
+    routed: true,
   };
 }
 

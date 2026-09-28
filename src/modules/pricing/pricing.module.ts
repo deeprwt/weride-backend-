@@ -79,8 +79,22 @@ const PricingEnvSchema = z
     // How long a computed route is reused for pickup/dropoff pins within ~100 m.
     // Minimum 30 s: this cache is what stops a rider dragging a pin from billing
     // a request per frame, and it must not be possible to switch that off by
-    // accident. Short enough that the traffic-aware duration stays current.
-    ROUTE_CACHE_TTL_SECONDS: z.coerce.number().int().min(30).max(3600).default(300),
+    // accident.
+    //
+    // 30 minutes by default. Road geometry and free-flow distance between two
+    // fixed points do not change on a five-minute horizon, so the old 300 s
+    // bought nothing but repeat billing. Lower it only if ROUTE_TRAFFIC_AWARE
+    // is on and you want the cached duration to track congestion closely.
+    ROUTE_CACHE_TTL_SECONDS: z.coerce.number().int().min(30).max(3600).default(1800),
+    // Traffic-aware routing bills at a higher Google tier than static routing.
+    // It changes the DURATION only — distance, which dominates the fare, is
+    // identical either way. Off by default: the cheaper tier keeps fares just
+    // as accurate and only makes the quoted ETA less congestion-sensitive.
+    // Turn on if you advertise arrival times and accept the bill.
+    ROUTE_TRAFFIC_AWARE: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((v) => v === 'true'),
   })
   .superRefine((cfg, ctx) => {
     // Same class of mistake as a dispatch ladder that does not widen: a ramp
@@ -114,6 +128,8 @@ export interface RouteConfig {
   averageSpeedKmh: number;
   timeoutMs: number;
   cacheTtlSeconds: number;
+  /** Ask Google for a congestion-aware duration. Bills at a higher tier. */
+  trafficAware: boolean;
 }
 
 export interface PricingConfig {
@@ -161,6 +177,7 @@ export function loadPricingConfig(source: NodeJS.ProcessEnv = process.env): Pric
       averageSpeedKmh: cfg.ROUTE_AVERAGE_SPEED_KMH,
       timeoutMs: cfg.ROUTE_TIMEOUT_MS,
       cacheTtlSeconds: cfg.ROUTE_CACHE_TTL_SECONDS,
+      trafficAware: cfg.ROUTE_TRAFFIC_AWARE,
     },
   };
 }

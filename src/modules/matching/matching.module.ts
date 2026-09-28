@@ -1,5 +1,6 @@
 import { Module, forwardRef } from '@nestjs/common';
 import { GeoModule } from '../geo/geo.module';
+import { PricingModule } from '../pricing/pricing.module';
 import { RideStateService } from '../rides/ride-state.service';
 import { RidesModule } from '../rides/rides.module';
 import { DispatchWorker } from './dispatch.worker';
@@ -38,7 +39,7 @@ import { MatchingService, RIDE_STATE_PORT, type RideStatePort } from './matching
  * direction the second edge is added, DI still resolves at boot.
  */
 @Module({
-  imports: [GeoModule, forwardRef(() => RidesModule)],
+  imports: [GeoModule, PricingModule, forwardRef(() => RidesModule)],
   providers: [
     MatchingService,
     // Registered, not exported: the worker is a background task with no

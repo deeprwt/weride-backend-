@@ -5,6 +5,7 @@ import { LoggerModule } from 'nestjs-pino';
 import { HealthModule } from './common/health/health.module';
 import { IdentityProviderModule } from './common/identity/identity.module';
 import { PricingClientModule } from './common/pricing-client/pricing-client.module';
+import { PlacesModule } from './modules/places/places.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { RedisModule } from './common/redis/redis.module';
@@ -58,6 +59,7 @@ import { pinoOptions } from './common/logger';
     GeoModule, // Phase 3
     MatchingModule, // Phase 3
     RidesModule, // Phase 3
+    PlacesModule, // Phase 3 — address search proxy
     PaymentsModule, // Phase 4
     NotificationsModule, // Phase 5
     SafetyModule, // Phase 5

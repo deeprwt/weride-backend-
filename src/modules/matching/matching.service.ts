@@ -29,6 +29,7 @@ import { PrismaService } from '../../common/prisma/prisma.module';
 import { RedisService } from '../../common/redis/redis.module';
 import { loadEnv } from '../../config/env';
 import { GeoService } from '../geo/geo.service';
+import { RouteEstimatorService } from '../pricing/route-estimator.service';
 import {
   H3DriverIndexService,
   type IndexedDriverStatus,
@@ -190,6 +191,16 @@ export interface OfferAcceptance {
  */
 const ROAD_DETOUR_FACTOR = 1.3;
 
+/**
+ * How many candidates get routed when re-ranking a shortlist.
+ *
+ * The matrix bills per origin, so this is the per-round cost ceiling. Eight is
+ * comfortably more than DISPATCH_CANDIDATES_PER_ROUND, which is what gives the
+ * ranking something to choose between, while keeping a wave's spend flat no
+ * matter how dense the neighbourhood is.
+ */
+const ROAD_RANKING_MAX_ORIGINS = 8;
+
 /** Nobody is ever 20 seconds away once finding the car and the door are counted. */
 const MIN_ETA_SECONDS = 60;
 
@@ -259,8 +270,14 @@ interface WaveSearch {
 /** A driver a wave has decided to offer, with what the ranking and the offer row need. */
 interface DispatchCandidate {
   driverId: string;
+  /** Straight-line metres at selection; replaced by road metres once ranked. */
   distanceMeters: number;
   ratingAvg: number | null;
+  /** Where the driver was when the pool was built — the matrix origin. */
+  lat: number;
+  lng: number;
+  /** Routed seconds to the pickup. Absent when road ranking did not run. */
+  roadEtaSeconds?: number;
 }
 
 interface RetiredOfferRow {
@@ -323,6 +340,7 @@ export class MatchingService {
     private readonly geo: GeoService,
     private readonly index: H3DriverIndexService,
     private readonly redis: RedisService,
+    private readonly routes: RouteEstimatorService,
     @Inject(RIDE_STATE_PORT) private readonly rideState: RideStatePort,
   ) {
     const env = loadEnv();
@@ -552,7 +570,10 @@ export class MatchingService {
               round,
               status: 'pending',
               distanceMeters: candidate.distanceMeters,
-              etaSeconds: this.etaSecondsFor(candidate.distanceMeters),
+              // Routed seconds when road ranking produced them, the
+              // detour-factor estimate otherwise.
+              etaSeconds:
+                candidate.roadEtaSeconds ?? this.etaSecondsFor(candidate.distanceMeters),
               expiresAt,
             })),
           });
@@ -662,6 +683,86 @@ export class MatchingService {
    * position, which differs from the spheroid PostGIS used by well under a
    * percent at city scale — noise beside GPS error.
    */
+  /**
+   * Re-rank a shortlist by real road time, then take the top `wanted`.
+   *
+   * Straight-line is the right question for building the POOL — a radius is
+   * cheap and indexed, and every driver in it is plausibly close. It is the
+   * wrong question for choosing WHO TO ASK.
+   *
+   * The river case: a driver 5 km away across the water is 10 km by road, while
+   * one 6 km away beside the bridge is 7 km. Sorted on straight line, the first
+   * driver wins the slice, the second is never asked, the rider waits longer
+   * and the winner drives a long dead leg. Sorted on road time, the bridge
+   * driver gets the offer — which is simply the correct answer.
+   *
+   * It runs whenever there is anybody to ask — NOT only when the shortlist is
+   * long enough for the order to change hands. An earlier version skipped the
+   * call in that case, reasoning that ranking cannot change who is asked when
+   * everyone is asked anyway. That saved calls and produced wrong numbers: the
+   * ETA and distance on the offer are what a driver reads before accepting, and
+   * on the straight-line estimate the far-bank driver is told "4 minutes" for a
+   * ten-kilometre drive around the water. A driver deciding on a false number
+   * is worse than an extra matrix element.
+   *
+   * Cost is bounded two ways, because this runs per dispatch round:
+   *  - At most ROAD_RANKING_MAX_ORIGINS origins, in ONE batched matrix call,
+   *    so a dense neighbourhood costs exactly what a sparse one does.
+   *  - Skipped when no routing provider is configured, where the matrix would
+   *    return the straight-line arithmetic the caller already has.
+   *
+   * Never throws. Any origin that fails to route keeps its detour estimate, so
+   * the worst case is the ordering dispatch used before this existed.
+   */
+  private async rankByRoad(
+    candidates: DispatchCandidate[],
+    ride: Ride,
+    wanted: number,
+  ): Promise<DispatchCandidate[]> {
+    if (candidates.length === 0) return candidates;
+
+    const shortlist = candidates.slice(0, ROAD_RANKING_MAX_ORIGINS);
+    const pickup = { lat: ride.pickupLat, lng: ride.pickupLng };
+
+    let legs;
+    try {
+      legs = await this.routes.estimateMatrix(
+        shortlist.map((c) => ({ lat: c.lat, lng: c.lng })),
+        pickup,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Road ranking failed for ride ${ride.id}; using straight-line order: ${describeError(error)}`,
+      );
+      return candidates.slice(0, wanted);
+    }
+
+    const ranked = shortlist
+      .map((candidate, i) => ({ candidate, leg: legs[i] }))
+      .sort((a, b) => {
+        const byTime = (a.leg?.durationSeconds ?? Infinity) - (b.leg?.durationSeconds ?? Infinity);
+        if (byTime !== 0) return byTime;
+        return (b.candidate.ratingAvg ?? 0) - (a.candidate.ratingAvg ?? 0);
+      });
+
+    const routedCount = legs.filter((l) => l.routed).length;
+    if (routedCount > 0) {
+      this.logger.debug(
+        `Ride ${ride.id}: ranked ${shortlist.length} candidates on road time ` +
+          `(${routedCount} routed).`,
+      );
+    }
+
+    // Carry the road numbers onto the offer so the driver is told the distance
+    // they will actually drive, and so "why was this driver asked" is
+    // answerable from the row months later.
+    return ranked.slice(0, wanted).map(({ candidate, leg }) =>
+      leg && leg.routed
+        ? { ...candidate, distanceMeters: leg.distanceMeters, roadEtaSeconds: leg.durationSeconds }
+        : candidate,
+    );
+  }
+
   private async selectCandidates(ride: Ride, search: WaveSearch): Promise<DispatchCandidate[]> {
     const wanted = this.candidatesPerRound;
     const cleared = new Map<string, EligibleDriver>();
@@ -705,7 +806,7 @@ export class MatchingService {
       const mayHoldMore =
         pool.length >= limit && farthest !== undefined && farthest.distanceMeters <= search.capMeters;
       if (candidates.length >= wanted || !mayHoldMore || limit >= CANDIDATE_POOL_CEILING) {
-        return candidates.slice(0, wanted);
+        return this.rankByRoad(candidates, ride, wanted);
       }
       limit = Math.min(CANDIDATE_POOL_CEILING, limit * CANDIDATE_OVERFETCH);
     }
@@ -908,7 +1009,22 @@ export class MatchingService {
     const pickupDistanceMeters = input.location
       ? await this.geo.distanceMeters(input.location, pickup)
       : offer.distanceMeters;
-    const pickupEtaSeconds = this.etaSecondsFor(pickupDistanceMeters);
+
+    // The ETA the rider is shown, and the only place in dispatch worth a real
+    // route. Candidate SELECTION stays straight-line — a radius is the right
+    // question when choosing whom to ask, and routing every candidate of every
+    // round would multiply the bill by the whole funnel. But once a driver has
+    // accepted, "4 minutes away" is a promise, and a straight line is a bad
+    // basis for one: a driver 5 km across a river can be 12 km by road, so the
+    // rider is told 5 minutes and waits 15.
+    //
+    // One route per accepted ride, and the estimator's ~100 m cache usually
+    // makes even that free. It never throws and degrades to the same
+    // detour-factor arithmetic this used to do, so a routing outage costs
+    // accuracy, never an acceptance.
+    const pickupEtaSeconds = input.location
+      ? (await this.routes.estimate(input.location, pickup)).durationSeconds
+      : this.etaSecondsFor(pickupDistanceMeters);
 
     let losers: { id: string; driverId: string }[] = [];
     try {
@@ -1214,7 +1330,13 @@ export class MatchingService {
     }
   }
 
-  /** Straight-line metres → a defensible ETA, until a routing provider exists. */
+  /**
+   * Straight-line metres → an approximate ETA.
+   *
+   * Still correct for OFFERS: a wave quotes many candidates and must stay
+   * cheap, and the number is superseded the moment somebody accepts. The
+   * rider-facing ETA is routed in `accept()` instead.
+   */
   private etaSecondsFor(distanceMeters: number): number {
     const seconds = Math.round((distanceMeters * ROAD_DETOUR_FACTOR) / this.averageSpeedMps);
     return Math.max(MIN_ETA_SECONDS, seconds);
@@ -1418,6 +1540,8 @@ function rankCandidates(
       driverId: driver.driverId,
       distanceMeters: driver.distanceMeters,
       ratingAvg: eligible.ratingAvg,
+      lat: driver.lat,
+      lng: driver.lng,
     });
   }
   return candidates.sort(
