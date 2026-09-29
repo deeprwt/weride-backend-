@@ -496,6 +496,7 @@ function rideFixture(overrides: Partial<Ride> = {}): Ride {
     currency: 'CAD',
     cancelReason: null,
     routePolyline: null,
+    fareBreakdown: null,
     // Every lifecycle column starts null, so a case can assert that a status
     // stamped its own column and nobody else's.
     searchingAt: null,

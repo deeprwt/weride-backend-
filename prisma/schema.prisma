@@ -186,6 +186,14 @@ model Ride {
   /// quoted while the maps provider was unreachable has no geometry, and the
   /// map correctly falls back to the straight line for that trip.
   routePolyline   String?   @map("route_polyline") @db.Text
+  /// The itemised fare this ride was quoted at, as a FareBreakdown.
+  ///
+  /// Stored because a receipt has to show what was charged and why, and the
+  /// quote that produced those numbers is gone the moment the ride is created.
+  /// Recomputing later would give a DIFFERENT answer — surge and tariffs move —
+  /// which is the one thing a receipt must never do. Nullable: rides created
+  /// before this column, and any quoted while pricing was degraded, have none.
+  fareBreakdown   Json?     @map("fare_breakdown")
   // Phase 3 — lifecycle timestamps, one per stage of the trip.
   searchingAt          DateTime? @map("searching_at") @db.Timestamptz()
   acceptedAt           DateTime? @map("accepted_at") @db.Timestamptz()

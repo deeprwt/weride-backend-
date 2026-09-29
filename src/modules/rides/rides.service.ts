@@ -5,6 +5,7 @@ import type { QuoteRequestInput, RideCancelInput, RideRequestInput } from '@urid
 import {
   isCancellableRideStatus,
   type DriverId,
+  type FareBreakdown,
   type FareQuote,
   type ISODateTime,
   type RideClass,
@@ -64,6 +65,11 @@ export interface RideView extends RideSummary {
   driver: RideDriverInfo | null;
   /** The 4-digit pickup code. Returned to the RIDER only — see {@link toRideView}. */
   pickupOtp: string | null;
+  /**
+   * What the fare was made of, as quoted. Null for rides created before this
+   * was stored, or quoted while pricing was degraded.
+   */
+  fareBreakdown: FareBreakdown | null;
   /**
    * Encoded polyline of the road route, for drawing the trip on a map.
    *
@@ -258,6 +264,10 @@ export class RidesService {
           // straight line between the pins. Null when no provider answered;
           // the client falls back for that trip rather than showing nothing.
           routePolyline: polyline,
+          // The receipt's line items. Stored now because the quote that
+          // produced them does not survive this request, and recomputing later
+          // would give different numbers as surge and tariffs move.
+          fareBreakdown: { ...fare.breakdown },
           pickupOtp: generatePickupOtp(),
         },
       });
@@ -476,6 +486,10 @@ export function toRideView(r: RideWithParties, audience: RideViewAudience): Ride
     // Not redacted by audience: the driver needs the route as much as the
     // rider, and it describes the trip rather than either party.
     routePolyline: r.routePolyline ?? null,
+    // Prisma types a Json column as JsonValue; the shape is ours and was
+    // written by this service, so the cast is describing a fact rather than
+    // asserting a hope.
+    fareBreakdown: (r.fareBreakdown as FareBreakdown | null) ?? null,
   };
 }
 

@@ -711,6 +711,7 @@ function rideFixture(overrides: Partial<Ride> = {}): Ride {
     currency: 'CAD',
     cancelReason: null,
     routePolyline: null,
+    fareBreakdown: null,
     searchingAt: now,
     acceptedAt: now,
     arrivedAt: null,
