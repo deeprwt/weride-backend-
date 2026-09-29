@@ -9,5 +9,10 @@ NIXPACKS_NODE_VERSION = "22"
 [phases.build]
 cmds = ["npx prisma generate", "npm run build:standalone"]
 
+# Migrations run as part of starting, not as a step somebody remembers. A
+# deploy that ships code writing a column the database does not have looks
+# healthy — /healthz passes, routes mount — and only fails when a rider tries
+# to book. Applying first means the container refuses to start instead, which
+# is loud and visible in the deploy log.
 [start]
-cmd = "npm run start"
+cmd = "npm run start:prod"

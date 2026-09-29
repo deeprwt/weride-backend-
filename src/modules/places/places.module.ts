@@ -96,14 +96,19 @@ function loadPlacesConfig(): PlacesConfig & { photonBaseUrl: string } {
       useFactory: (): GeocodingProvider => {
         const config = loadPlacesConfig();
         if (config.provider === 'google') {
-          const apiKey = process.env.GOOGLE_MAPS_API_KEY ?? '';
+          // Trimmed: a value pasted into a deployment panel with a trailing
+          // space or newline is non-empty, so it would pass this guard and then
+          // fail on every upstream call with an opaque 403.
+          const apiKey = (process.env.GOOGLE_MAPS_API_KEY ?? '').trim();
           // Booting google-without-a-key would look healthy and return an empty
           // list for every search, which reads as "no results" rather than
           // "misconfigured". Refuse instead.
           if (apiKey.length === 0) {
             throw new Error(
-              '[uride-api] PLACES_PROVIDER=google requires GOOGLE_MAPS_API_KEY. ' +
-                'Use PLACES_PROVIDER=photon for the free provider.',
+              '[uride-api] PLACES_PROVIDER=google requires GOOGLE_MAPS_API_KEY ' +
+                'to be set in the environment of THIS deployment — a local .env ' +
+                'file does not reach the server. ' +
+                'reach the server). Use PLACES_PROVIDER=photon for the free provider.',
             );
           }
           return new GooglePlacesProvider(apiKey, config.timeoutMs);

@@ -25,7 +25,8 @@
     "prisma:studio": "prisma studio",
     "seed:admin": "node --env-file-if-exists=.env scripts/seed-admin.ts",
     "build:libs": "npm run build -w packages/types && npm run build -w packages/validation",
-    "seed:demo": "node scripts/seed-demo.mjs"
+    "seed:demo": "node scripts/seed-demo.mjs",
+    "start:prod": "prisma migrate deploy && node dist/main.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
