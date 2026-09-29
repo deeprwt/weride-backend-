@@ -64,6 +64,14 @@ export interface RideView extends RideSummary {
   driver: RideDriverInfo | null;
   /** The 4-digit pickup code. Returned to the RIDER only — see {@link toRideView}. */
   pickupOtp: string | null;
+  /**
+   * Encoded polyline of the road route, for drawing the trip on a map.
+   *
+   * Null for rides quoted while no routing provider answered, and for every
+   * ride created before the route was stored. Clients fall back to joining the
+   * two pins in that case, which is the behaviour every ride had before.
+   */
+  routePolyline: string | null;
 }
 
 /**
@@ -217,13 +225,17 @@ export class RidesService {
     // to the pricing service, and holding a pooled Postgres connection open
     // across a network round trip is how a slow dependency turns into pool
     // exhaustion for every other request.
+    const { polyline, ...pricingInputs } = await this.pricingInputsFor(
+      input.pickup,
+      input.dropoff,
+    );
     const fare = await this.pricing.quote(
       {
         pickup: input.pickup,
         dropoff: input.dropoff,
         rideClass: input.rideClass,
       },
-      await this.pricingInputsFor(input.pickup, input.dropoff),
+      pricingInputs,
     );
 
     const ride = await this.prisma.$transaction(async (tx) => {
@@ -242,6 +254,10 @@ export class RidesService {
           durationSeconds: fare.durationSeconds,
           fareCents: fare.fareCents,
           currency: fare.currency,
+          // Stored so the live trip map can draw the road route instead of a
+          // straight line between the pins. Null when no provider answered;
+          // the client falls back for that trip rather than showing nothing.
+          routePolyline: polyline,
           pickupOtp: generatePickupOtp(),
         },
       });
@@ -457,6 +473,9 @@ export function toRideView(r: RideWithParties, audience: RideViewAudience): Ride
     // endpoints share this mapper, and a driver who can read the code does not
     // need the rider to be in the car.
     pickupOtp: audience === 'rider' && OTP_VISIBLE_STATUSES.includes(status) ? r.pickupOtp : null,
+    // Not redacted by audience: the driver needs the route as much as the
+    // rider, and it describes the trip rather than either party.
+    routePolyline: r.routePolyline ?? null,
   };
 }
 

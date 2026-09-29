@@ -179,6 +179,13 @@ model Ride {
   fareCents       Int?      @map("fare_cents")
   currency        String    @default("CAD") @db.Text
   cancelReason    String?   @map("cancel_reason") @db.Text
+  /// Google-encoded polyline of the road route this ride was quoted on.
+  /// Stored because the live trip map has to draw the route the driver will
+  /// actually take; without it the screen can only join the two pins, which
+  /// renders a straight line across rivers and railways. Nullable: a ride
+  /// quoted while the maps provider was unreachable has no geometry, and the
+  /// map correctly falls back to the straight line for that trip.
+  routePolyline   String?   @map("route_polyline") @db.Text
   // Phase 3 — lifecycle timestamps, one per stage of the trip.
   searchingAt          DateTime? @map("searching_at") @db.Timestamptz()
   acceptedAt           DateTime? @map("accepted_at") @db.Timestamptz()
